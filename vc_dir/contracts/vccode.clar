@@ -1,4 +1,6 @@
 ;; Vehicle Registration and Ownership Management Contract
+;; This contract enables vehicle registration and manages ownership records
+;; through verifiable documentation and transfer mechanisms
 
 ;; Error codes
 (define-constant ERROR-UNAUTHORIZED-ACCESS (err u100))
@@ -46,7 +48,7 @@
     }
 )
 
-;; Private validation functions
+;; Private functions
 (define-private (validate-verification-proof 
     (submitted-proof (buff 32)) 
     (stored-hash (buff 32)))
@@ -75,12 +77,22 @@
     )
 )
 
-;; Public functions for full vehicle management
+(define-private (validate-buff32 (input (buff 32)))
+    (is-eq (len input) u32)
+)
+
+(define-private (validate-buff33 (input (buff 33)))
+    (is-eq (len input) u33)
+)
+
+;; Public functions
 (define-public (register-vehicle 
     (owner-public-key (buff 33)) 
     (vehicle-hash (buff 32)))
     (let
         ((current-user tx-sender))
+        (asserts! (validate-buff33 owner-public-key) ERROR-INVALID-INPUT)
+        (asserts! (validate-buff32 vehicle-hash) ERROR-INVALID-INPUT)
         (asserts! (is-none (map-get? registered-vehicles current-user)) ERROR-VEHICLE-EXISTS)
         (ok (map-set registered-vehicles
             current-user
@@ -102,6 +114,9 @@
     (let
         ((current-user tx-sender)
          (vehicle-record (unwrap! (map-get? registered-vehicles current-user) ERROR-VEHICLE-NOT-FOUND)))
+        (asserts! (validate-buff32 record-hash) ERROR-INVALID-INPUT)
+        (asserts! (validate-timestamp expiration-timestamp) ERROR-INVALID-INPUT)
+        (asserts! (> expiration-timestamp CURRENT-TIME) ERROR-RECORD-EXPIRED)
         (asserts! (not (get vehicle-revoked vehicle-record)) ERROR-UNAUTHORIZED-ACCESS)
         (map-set record-details
             record-hash
@@ -128,6 +143,8 @@
     (required-attributes (list 5 (string-utf8 64))))
     (let
         ((requesting-user tx-sender))
+        (asserts! (validate-buff32 request-identifier) ERROR-INVALID-INPUT)
+        (asserts! (is-none (map-get? transfer-requests request-identifier)) ERROR-INVALID-INPUT)
         (ok (map-set transfer-requests
             request-identifier
             {
@@ -147,6 +164,8 @@
         ((current-user tx-sender)
          (transfer-request (unwrap! (map-get? transfer-requests request-identifier) ERROR-UNAUTHORIZED-ACCESS))
          (vehicle-record (unwrap! (map-get? registered-vehicles current-user) ERROR-VEHICLE-NOT-FOUND)))
+        (asserts! (validate-buff32 request-identifier) ERROR-INVALID-INPUT)
+        (asserts! (validate-buff32 verification-proof) ERROR-INVALID-INPUT)
         (asserts! (not (get vehicle-revoked vehicle-record)) ERROR-UNAUTHORIZED-ACCESS)
         (asserts! (validate-verification-proof verification-proof (get vehicle-hash vehicle-record)) ERROR-INVALID-VERIFICATION-PROOF)
         (ok (map-set transfer-requests
@@ -161,7 +180,49 @@
     )
 )
 
-;; Read-only verification functions
+(define-public (revoke-vehicle-record (record-hash (buff 32)))
+    (let
+        ((current-user tx-sender)
+         (record-info (unwrap! (map-get? record-details record-hash) ERROR-UNAUTHORIZED-ACCESS)))
+        (asserts! (validate-buff32 record-hash) ERROR-INVALID-INPUT)
+        (asserts! (is-eq (get record-issuer record-info) current-user) ERROR-UNAUTHORIZED-ACCESS)
+        (ok (map-set record-details
+            record-hash
+            (merge record-info {record-revoked: true})
+        ))
+    )
+)
+
+(define-public (update-vehicle-record 
+    (updated-vehicle-hash (buff 32)) 
+    (updated-public-key (buff 33)))
+    (let
+        ((current-user tx-sender)
+         (existing-record (unwrap! (map-get? registered-vehicles current-user) ERROR-VEHICLE-NOT-FOUND)))
+        (asserts! (validate-buff32 updated-vehicle-hash) ERROR-INVALID-INPUT)
+        (asserts! (validate-buff33 updated-public-key) ERROR-INVALID-INPUT)
+        (asserts! (not (get vehicle-revoked existing-record)) ERROR-UNAUTHORIZED-ACCESS)
+        (ok (map-set registered-vehicles
+            current-user
+            (merge existing-record
+                {
+                    vehicle-hash: updated-vehicle-hash,
+                    owner-public-key: updated-public-key
+                }
+            )
+        ))
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-vehicle-details (owner-principal principal))
+    (map-get? registered-vehicles owner-principal)
+)
+
+(define-read-only (get-record-details (record-hash (buff 32)))
+    (map-get? record-details record-hash)
+)
+
 (define-read-only (verify-transfer-request
     (request-identifier (buff 32))
     (submitted-proof (buff 32)))
