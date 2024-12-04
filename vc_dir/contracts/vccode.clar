@@ -1,13 +1,17 @@
-;; Vehicle Registration with Record Management
+;; Vehicle Registration and Ownership Management Contract
 
 ;; Error codes
 (define-constant ERROR-UNAUTHORIZED-ACCESS (err u100))
 (define-constant ERROR-VEHICLE-EXISTS (err u101))
 (define-constant ERROR-VEHICLE-NOT-FOUND (err u102))
-(define-constant ERROR-RECORD-LIMIT-EXCEEDED (err u103))
+(define-constant ERROR-INVALID-VERIFICATION-PROOF (err u103))
+(define-constant ERROR-RECORD-EXPIRED (err u104))
+(define-constant ERROR-INVALID-INPUT (err u105))
 
-;; Constants
-(define-constant MAX-RECORDS u5)
+;; Constants for validation
+(define-constant MIN-TIMESTAMP u1)
+(define-constant MAX-TIMESTAMP u9999999999)
+(define-constant CURRENT-TIME u1703980800) ;; Example fixed timestamp
 
 ;; Data Maps
 (define-map registered-vehicles
@@ -15,21 +19,66 @@
     {
         vehicle-hash: (buff 32),
         registration-timestamp: uint,
-        vehicle-records: (list 5 (buff 32))
+        vehicle-records: (list 10 (buff 32)),
+        owner-public-key: (buff 33),
+        vehicle-revoked: bool
     }
 )
 
 (define-map record-details
     (buff 32)  ;; record hash
     {
-        record-type: (string-utf8 32),
+        record-issuer: principal,
         issuance-timestamp: uint,
-        record-data: (buff 64)
+        expiration-timestamp: uint,
+        record-category: (string-utf8 64),
+        record-revoked: bool
     }
 )
 
-;; Public functions
-(define-public (register-vehicle (vehicle-hash (buff 32)))
+(define-map transfer-requests
+    (buff 32)  ;; transfer request ID
+    {
+        requesting-entity: principal,
+        requested-attributes: (list 5 (string-utf8 64)),
+        request-approved: bool,
+        verification-proof: (buff 32)
+    }
+)
+
+;; Private validation functions
+(define-private (validate-verification-proof 
+    (submitted-proof (buff 32)) 
+    (stored-hash (buff 32)))
+    (is-eq submitted-proof stored-hash)
+)
+
+(define-private (check-record-status 
+    (record-hash (buff 32))
+    (record-info {
+        record-issuer: principal, 
+        issuance-timestamp: uint, 
+        expiration-timestamp: uint, 
+        record-category: (string-utf8 64), 
+        record-revoked: bool
+    }))
+    (and
+        (< CURRENT-TIME (get expiration-timestamp record-info))
+        (not (get record-revoked record-info))
+    )
+)
+
+(define-private (validate-timestamp (timestamp uint))
+    (and 
+        (>= timestamp MIN-TIMESTAMP)
+        (<= timestamp MAX-TIMESTAMP)
+    )
+)
+
+;; Public functions for full vehicle management
+(define-public (register-vehicle 
+    (owner-public-key (buff 33)) 
+    (vehicle-hash (buff 32)))
     (let
         ((current-user tx-sender))
         (asserts! (is-none (map-get? registered-vehicles current-user)) ERROR-VEHICLE-EXISTS)
@@ -37,8 +86,10 @@
             current-user
             {
                 vehicle-hash: vehicle-hash,
-                registration-timestamp: block-height,
-                vehicle-records: (list)
+                registration-timestamp: CURRENT-TIME,
+                vehicle-records: (list),
+                owner-public-key: owner-public-key,
+                vehicle-revoked: false
             }
         ))
     )
@@ -46,41 +97,86 @@
 
 (define-public (add-vehicle-record 
     (record-hash (buff 32))
-    (record-type (string-utf8 32))
-    (record-data (buff 64)))
+    (expiration-timestamp uint)
+    (record-category (string-utf8 64)))
     (let
         ((current-user tx-sender)
          (vehicle-record (unwrap! (map-get? registered-vehicles current-user) ERROR-VEHICLE-NOT-FOUND)))
-        (asserts! 
-            (< (len (get vehicle-records vehicle-record)) MAX-RECORDS) 
-            ERROR-RECORD-LIMIT-EXCEEDED
-        )
+        (asserts! (not (get vehicle-revoked vehicle-record)) ERROR-UNAUTHORIZED-ACCESS)
         (map-set record-details
             record-hash
             {
-                record-type: record-type,
-                issuance-timestamp: block-height,
-                record-data: record-data
+                record-issuer: current-user,
+                issuance-timestamp: CURRENT-TIME,
+                expiration-timestamp: expiration-timestamp,
+                record-category: record-category,
+                record-revoked: false
             }
         )
         (ok (map-set registered-vehicles
             current-user
             (merge vehicle-record
-                {vehicle-records: (unwrap! 
-                    (as-max-len? 
-                        (append (get vehicle-records vehicle-record) record-hash) 
-                        MAX-RECORDS
-                    ) ERROR-RECORD-LIMIT-EXCEEDED)
+                {vehicle-records: (unwrap! (as-max-len? (append (get vehicle-records vehicle-record) record-hash) u10)
+                    ERROR-UNAUTHORIZED-ACCESS)}
+            )
+        ))
+    )
+)
+
+(define-public (initiate-transfer-request
+    (request-identifier (buff 32))
+    (required-attributes (list 5 (string-utf8 64))))
+    (let
+        ((requesting-user tx-sender))
+        (ok (map-set transfer-requests
+            request-identifier
+            {
+                requesting-entity: requesting-user,
+                requested-attributes: required-attributes,
+                request-approved: false,
+                verification-proof: 0x00
+            }
+        ))
+    )
+)
+
+(define-public (approve-transfer
+    (request-identifier (buff 32))
+    (verification-proof (buff 32)))
+    (let
+        ((current-user tx-sender)
+         (transfer-request (unwrap! (map-get? transfer-requests request-identifier) ERROR-UNAUTHORIZED-ACCESS))
+         (vehicle-record (unwrap! (map-get? registered-vehicles current-user) ERROR-VEHICLE-NOT-FOUND)))
+        (asserts! (not (get vehicle-revoked vehicle-record)) ERROR-UNAUTHORIZED-ACCESS)
+        (asserts! (validate-verification-proof verification-proof (get vehicle-hash vehicle-record)) ERROR-INVALID-VERIFICATION-PROOF)
+        (ok (map-set transfer-requests
+            request-identifier
+            (merge transfer-request
+                {
+                    request-approved: true,
+                    verification-proof: verification-proof
                 }
             )
         ))
     )
 )
 
-(define-read-only (get-vehicle-details (owner-principal principal))
-    (map-get? registered-vehicles owner-principal)
+;; Read-only verification functions
+(define-read-only (verify-transfer-request
+    (request-identifier (buff 32))
+    (submitted-proof (buff 32)))
+    (match (map-get? transfer-requests request-identifier)
+        request-info (and
+            (get request-approved request-info)
+            (validate-verification-proof submitted-proof (get verification-proof request-info))
+        )
+        false
+    )
 )
 
-(define-read-only (get-record-details (record-hash (buff 32)))
-    (map-get? record-details record-hash)
+(define-read-only (check-record-validity (record-hash (buff 32)))
+    (match (map-get? record-details record-hash)
+        record-info (check-record-status record-hash record-info)
+        false
+    )
 )
